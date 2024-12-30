@@ -22,7 +22,6 @@ struct UvTest
   }
 };
 
-
 TEST_F(UvTest, Basic) {
   auto* uvLoop = uv_default_loop();
   kj::UvEventPort eventPort{uvLoop};
@@ -31,9 +30,22 @@ TEST_F(UvTest, Basic) {
 
   auto lowLevel = kj::newUvLowLevelAsyncIoProvider(eventPort);
   auto aio = kj::newAsyncIoProvider(*lowLevel);
+}
 
-  auto& network = aio->getNetwork();
-  auto addr = network.parseAddress("localhost").wait(waitScope);
+TEST_F(UvTest, CrossThreadFulfiller) {
+  auto* uvLoop = uv_default_loop();
+  kj::UvEventPort eventPort{uvLoop};
+  kj::EventLoop kjLoop{eventPort};
+  kj::WaitScope waitScope{kjLoop};
+
+  auto [promise, fulfiller] = kj::newPromiseAndCrossThreadFulfiller<void>();
+
+  auto thread = kj::Thread([fulfiller = kj::mv(fulfiller)]{
+    KJ_LOG(ERROR, "Fulfilling from thread");
+    fulfiller->fulfill();
+  });
+  
+  promise.wait(waitScope);
 }
 
 int main(int argc, char* argv[]) {

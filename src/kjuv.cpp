@@ -142,12 +142,14 @@ static int applyFlags(int fd, uint flags) {
 }
 
 void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
+  KJ_LOG(ERROR, "doEventFd");
   UvEventPort* self = reinterpret_cast<UvEventPort*>(handle->data);
   uint64_t value;
   ssize_t n;
   KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
   KJ_ASSERT(n < 0 || n == sizeof(value));
-  self->run();
+  KJ_LOG(ERROR, "doEventFd setting runnable=true");
+  self->setRunnable(true);
 }
 
 UvEventPort::UvEventPort(uv_loop_t* loop)
@@ -162,7 +164,7 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
 
   uv_poll_init(loop, &eventHandle, eventFd);
   eventHandle.data = this;
-  UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd);
+  UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd), loop);
 }
 
 UvEventPort::~UvEventPort() {
@@ -170,10 +172,11 @@ UvEventPort::~UvEventPort() {
     UV_CALL(uv_timer_stop(&timer), loop);
   }
 
-  UV_CALL(uv_poll_stop(&eventHandle));
+  UV_CALL(uv_poll_stop(&eventHandle), loop);
 }
 
 void UvEventPort::run() {
+  KJ_LOG(ERROR, "run", scheduled, runnable, kjLoop.isRunnable());
   KJ_ASSERT(scheduled);
 
   UV_CALL(uv_timer_stop(&timer), loop);
@@ -573,18 +576,17 @@ public:
       }
     }
 
-    auto result = kj::heap<UvIoStream>(eventPort.getUvLoop(), fd, flags);
-    auto connected = result->onWritable();
-    return connected.then(kj::mvCapture(result,
-        [fd](kj::Own<kj::AsyncIoStream>&& stream) {
-          int err;
-          socklen_t errlen = sizeof(err);
-          KJ_SYSCALL(getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen));
-          if (err != 0) {
-            KJ_FAIL_SYSCALL("connect()", err) { break; }
-          }
-          return kj::mv(stream);
-        }));
+    auto stream = kj::heap<UvIoStream>(eventPort.getUvLoop(), fd, flags);
+    auto connected = stream->onWritable();
+    return connected.then([fd, stream = kj::mv(stream)]() mutable {
+      int err;
+      socklen_t errlen = sizeof(err);
+      KJ_SYSCALL(getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen));
+      if (err != 0) {
+        KJ_FAIL_SYSCALL("connect()", err) { break; }
+      }
+      return kj::Own<kj::AsyncIoStream>(kj::mv(stream));
+    });
   }
 
 #if CAPNP_VERSION < 7000
@@ -609,9 +611,91 @@ private:
   UvEventPort& eventPort;
 };
 
-kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(UvEventPort& eventPort) {
+/*
+struct UvAsyncIoProvider
+  : kj::AsyncIoProvider {
+
+  UvAsyncIoProvider(UvLowLevelAsyncIoProvider& lowLevel)
+    : lowLevel_{lowLevel} {
+  }
+
+  
+  OneWayPipe newOneWayPipe() override {
+    int fds[2]{};
+    KJ_SYSCALL(pipe2(fds, O_NONBLOCK | O_CLOEXEC));
+    return kj::OneWayPipe {
+      lowLevel_.wrapInputFd(fds[0], NEW_FD_FLAGS),
+      lowLevel.wrapOutputFd(fds[1], NEW_FD_FLAGS)
+    };
+  }
+
+  TwoWayPipe newTwoWayPipe() override {
+    int fds[2]{};
+    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    return kj::TwoWayPipe { {
+      lowLevel_.wrapSocketFd(fds[0], NEW_FD_FLAGS),
+      lowLevel_.wrapSocketFd(fds[1], NEW_FD_FLAGS)
+    } };
+  }
+
+  kj::CapabilityPipe newCapabilityPipe() override {
+    int fds[2]{};
+    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+    return kj::CapabilityPipe { {
+      lowLevel_.wrapUnixSocketFd(fds[0], NEW_FD_FLAGS),
+      lowLevel_.wrapUnixSocketFd(fds[1], NEW_FD_FLAGS)
+    } };
+  }
+
+  Network& getNetwork() override {
+    return network;
+  }
+
+  kj::PipeThread newPipeThread(
+      kj::Function<void(kj::AsyncIoProvider&, kj::AsyncIoStream&, kj::WaitScope&)> startFunc) override {
+    int fds[2]{};
+    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+
+    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
+
+    int threadFd = fds[1];
+    KJ_ON_SCOPE_FAILURE(close(threadFd));
+
+    auto pipe = lowLevel_.wrapSocketFd(fds[0], NEW_FD_FLAGS);
+
+    auto thread = kj::heap<kj::Thread>([threadFd, startFunc=kj::mv(startFunc)]() mutable {
+      UvEventPort eventPort;
+      kj::EventLoop eventLoop(eventPort);
+      kj::WaitScope waitScope(eventLoop);
+      UvLowLevelAsyncIoProvider lowLevel_{eventPort};
+      auto stream = lowLevel_.wrapSocketFd(threadFd, NEW_FD_FLAGS);
+      UvAsyncIoProvider ioProvider{lowLevel};
+      startFunc(ioProvider, *stream, waitScope);
+    });
+
+    return { kj::mv(thread), kj::mv(pipe) };
+  }
+
+  kj::Timer& getTimer() override { return lowLevel_.getTimer(); }
+
+private:
+  UvLowLevelAsyncIoProvider& lowLevel_;
+  SocketNetwork network;
+};
+*/
+
+kj::Own<kj::LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(kj::UvEventPort& eventPort) {
   return kj::heap<UvLowLevelAsyncIoProvider>(eventPort);
 }
+
+
+/*
+kj::Own<kj::AsyncIoProvider> newAsyncIoProvider(kj::LowLevelAsyncIoProvider& lowLevel) {
+  return kj::heap<UvAsyncIoProvider>(kj::downcast<UvLowLevelAsyncIoProvider>(lowLevel));
+}
+*/
 
 }
 

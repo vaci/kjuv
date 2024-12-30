@@ -25,7 +25,8 @@ class UvEventPort: public kj::EventPort {
   uv_loop_t* getUvLoop() { return loop; }
 
   bool wait() override {
-    UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
+    //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
+    uv_run(loop, UV_RUN_ONCE);
 
     // TODO(someday): Implement cross-thread wakeup.
     return false;
@@ -39,6 +40,7 @@ class UvEventPort: public kj::EventPort {
   }
 
   void wake() const override {
+    KJ_LOG(ERROR, "waking");
     uint64_t one = 1;
     ssize_t n;
     KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
@@ -46,9 +48,11 @@ class UvEventPort: public kj::EventPort {
   }
 
   void setRunnable(bool runnable) override {
+    KJ_LOG(ERROR, "setRunnable", runnable, kjLoop.isRunnable());
     if (runnable != this->runnable) {
       this->runnable = runnable;
       if (runnable && !scheduled) {
+        KJ_LOG(ERROR, "setRunnable: scheduling", runnable, scheduled);
         schedule();
       }
     }
@@ -65,8 +69,9 @@ private:
   uv_poll_t eventHandle;
 
   void schedule() {
-    UV_CALL(uv_timer_start(&timer, &doRun, 0, 0), loop);
+    KJ_LOG(ERROR, "Scheduled");
     scheduled = true;
+    UV_CALL(uv_timer_start(&timer, &doRun, 0, 0), loop);
   }
 
   void run();
@@ -82,4 +87,5 @@ private:
 
 kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(UvEventPort& eventPort);
 
+//kj::Own<kj::AsyncIoProvider> newAsyncIoProvider(kj::LowLevelAsyncIoProvider& lowLevel);
 }
