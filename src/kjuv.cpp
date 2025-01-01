@@ -148,11 +148,12 @@ void UvEventPort::doRun(uv_timer_t* handle) {
   self->run();
 }
 
-void UvEventPort::doTimer(uv_timer_t* timer)  {
+void UvEventPort::doTimer(uv_timer_t* handle)  {
+  KJ_ASSERT(handle != nullptr);
   KJ_LOG(ERROR, "doTimer");
-  auto* self = reinterpret_cast<UvEventPort*>(timer->data);
+  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->timerImpl.advanceTo(self->clock.now());
-  self->timeout();
+  self->scheduleTimers();
 }
 
 void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
@@ -162,22 +163,21 @@ void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
   ssize_t n;
   KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
   KJ_ASSERT(n < 0 || n == sizeof(value));
-  KJ_LOG(ERROR, "doEventFd setting runnable=true");
   self->setRunnable(true);
 }
 
 UvEventPort::UvEventPort(uv_loop_t* loop)
   : loop(loop),
     kjLoop(*this) {
-  uv_timer_init(loop, &uvScheduleTimer);
-  uvScheduleTimer.data = this;
+  uv_timer_init(loop, &uvWakeup);
+  uvWakeup.data = this;
 
+  // set up 
   uv_timer_init(loop, &uvTimer);
   uvTimer.data = this;
+  scheduleTimers();
 
-  KJ_LOG(ERROR, "Initial timer");
-  timeout();
-
+  // 
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
   eventFd = AutoCloseFd(fd);
@@ -187,35 +187,33 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
   UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd), loop);
 }
 
-void UvEventPort::schedule() {
-  KJ_LOG(ERROR, "Scheduling...");
-  scheduled = true;
-  UV_CALL(uv_timer_start(&uvScheduleTimer, &doRun, 0, 0), loop);
+UvEventPort::~UvEventPort() {
+  if (scheduled) {
+    UV_CALL(uv_timer_stop(&uvWakeup), loop);
+  }
+  UV_CALL(uv_timer_stop(&uvTimer), loop);
+  UV_CALL(uv_poll_stop(&eventHandle), loop);
 }
 
-void UvEventPort::timeout() {
-  KJ_LOG(ERROR, "cancelling uvTimer");
-  UV_CALL(uv_timer_stop(&uvTimer), loop);
-  
-  auto timeout = timerImpl.timeoutToNextEvent(clock.now(), kj::MILLISECONDS, uint64_t(maxValue)).orDefault(uint64_t(maxValue));
+void UvEventPort::schedule() {
+  KJ_LOG(ERROR, "scheduling loop run");
+  scheduled = true;
+  UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
+}
+
+void UvEventPort::scheduleTimers() {  
+  auto timeout = timerImpl.timeoutToNextEvent(
+    clock.now(), kj::MILLISECONDS, uint64_t(maxValue)
+  ).orDefault(uint64_t(maxValue));
 
   KJ_LOG(ERROR, "preparing uvTimer: ", timeout);
   UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
 }
 
-UvEventPort::~UvEventPort() {
-  if (scheduled) {
-    UV_CALL(uv_timer_stop(&uvScheduleTimer), loop);
-  }
-
-  UV_CALL(uv_timer_stop(&uvTimer), loop);
-
-  UV_CALL(uv_poll_stop(&eventHandle), loop);
-}
 
 bool UvEventPort::wait() {
   KJ_LOG(ERROR, "wait");
-  timeout();
+  scheduleTimers();
 
   //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
   uv_run(loop, UV_RUN_ONCE);
@@ -229,7 +227,7 @@ bool UvEventPort::wait() {
 
 bool UvEventPort::poll() {
   KJ_LOG(ERROR, "poll");
-  timeout();
+  scheduleTimers();
   UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
 
   timerImpl.advanceTo(clock.now());
@@ -247,38 +245,31 @@ void UvEventPort::wake() const {
 }
 
 void UvEventPort::setRunnable(bool runnable) {
-  KJ_LOG(ERROR, "setRunnable", runnable, kjLoop.isRunnable(), this->runnable);
-  if (runnable != this->runnable) {
-    this->runnable = runnable;
-    if (runnable && !scheduled) {
-      KJ_LOG(ERROR, "setRunnable: scheduling", runnable, scheduled);
-      schedule();
-    }
+  KJ_LOG(ERROR, "setRunnable", kjLoop.isRunnable());
+  if (runnable && !scheduled) {
+    KJ_LOG(ERROR, "setRunnable: scheduling", scheduled);
+    schedule();
   }
 }
 
 void UvEventPort::run() {
-  KJ_LOG(ERROR, "run", scheduled, runnable, kjLoop.isRunnable());
+  KJ_LOG(ERROR, "run", scheduled, kjLoop.isRunnable());
+
+  // stop scheduling
   KJ_ASSERT(scheduled);
+  UV_CALL(uv_timer_stop(&uvWakeup), loop);
+  scheduled = false;
 
-  UV_CALL(uv_timer_stop(&uvScheduleTimer), loop);
-
-
-  if (runnable) {
+  if (kjLoop.isRunnable()) {
     kjLoop.run();
   }
 
-  timeout();
+  scheduleTimers();
 
-  if (runnable) {
+  if (kjLoop.isRunnable()) {
     // Apparently either we never became non-runnable, or we did but then became runnable again.
-    // Since `scheduled` has been true the whole time, we won't have been rescheduled, so do that
-    // now.
     KJ_LOG(WARNING, "still runnable after kjLoop.run()?");
     schedule();
-  }
-  else {
-    scheduled = false;
   }
 }
 

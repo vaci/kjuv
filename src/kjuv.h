@@ -31,12 +31,14 @@ class UvEventPort: public kj::EventPort {
 
 private:
   uv_loop_t* loop;
-  uv_timer_t uvScheduleTimer;
 
   uv_timer_t uvTimer;
+  // fires when the next timer event is ready
+
+  uv_timer_t uvWakeup;
+  // fires when the KJ event loop is runnable
   
   kj::EventLoop kjLoop;
-  bool runnable = false;
   bool scheduled = false;
 
   kj::AutoCloseFd eventFd;
@@ -47,7 +49,7 @@ private:
 
   void schedule();
   void run();
-  void timeout();
+  void scheduleTimers();
 
   static void doRun(uv_timer_t* handle);
   static void doTimer(uv_timer_t* timer);
