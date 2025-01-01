@@ -1,6 +1,5 @@
 #include "kjuv.h"
 
-
 // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors
 // Licensed under the MIT License:
 //
@@ -21,6 +20,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
+
+// Largely cribbed from 
+// https://github.com/capnproto/node-capnp/blob/node14/src/node-capnp/capnp.cc
 
 #if __cplusplus >= 201300
 // Hack around stdlib bug with C++14.
@@ -54,6 +56,11 @@ namespace kj {
 // =======================================================================================
 // KJ <-> libuv glue.
 
+#define UV_CALL(code, loop, ...)                \
+  {                                             \
+    auto result = code;                                         \
+    KJ_ASSERT(result == 0, uv_strerror(result), ##__VA_ARGS__); \
+  }
 
 template <typename HandleType>
 class UvHandle {
@@ -142,7 +149,6 @@ static int applyFlags(int fd, uint flags) {
 }
 
 void UvEventPort::doRun(uv_timer_t* handle) {
-  KJ_LOG(ERROR, "doRun");
   KJ_ASSERT(handle != nullptr);
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->run();
@@ -150,53 +156,52 @@ void UvEventPort::doRun(uv_timer_t* handle) {
 
 void UvEventPort::doTimer(uv_timer_t* handle)  {
   KJ_ASSERT(handle != nullptr);
-  KJ_LOG(ERROR, "doTimer");
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->timerImpl.advanceTo(self->clock.now());
   self->scheduleTimers();
 }
 
 void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
-  KJ_LOG(ERROR, "doEventFd");
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   uint64_t value;
   ssize_t n;
   KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
   KJ_ASSERT(n < 0 || n == sizeof(value));
+  self->woken = true;
   self->setRunnable(true);
 }
 
 UvEventPort::UvEventPort(uv_loop_t* loop)
   : loop(loop),
-    kjLoop(*this) {
-  uv_timer_init(loop, &uvWakeup);
-  uvWakeup.data = this;
+    kjLoop(*this),
+    clock{kj::systemPreciseMonotonicClock()},
+    timerImpl{clock.now()} {
 
-  // set up 
+  // timer events
   uv_timer_init(loop, &uvTimer);
   uvTimer.data = this;
   scheduleTimers();
 
-  // 
+  // wakeup events
+  uv_timer_init(loop, &uvWakeup);
+  uvWakeup.data = this;
+
+  // cross-thread event fd
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
   eventFd = AutoCloseFd(fd);
-
   uv_poll_init(loop, &eventHandle, eventFd);
   eventHandle.data = this;
   UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd), loop);
 }
 
 UvEventPort::~UvEventPort() {
-  if (scheduled) {
-    UV_CALL(uv_timer_stop(&uvWakeup), loop);
-  }
+  UV_CALL(uv_timer_stop(&uvWakeup), loop);
   UV_CALL(uv_timer_stop(&uvTimer), loop);
   UV_CALL(uv_poll_stop(&eventHandle), loop);
 }
 
 void UvEventPort::schedule() {
-  KJ_LOG(ERROR, "scheduling loop run");
   scheduled = true;
   UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
 }
@@ -205,14 +210,11 @@ void UvEventPort::scheduleTimers() {
   auto timeout = timerImpl.timeoutToNextEvent(
     clock.now(), kj::MILLISECONDS, uint64_t(maxValue)
   ).orDefault(uint64_t(maxValue));
-
-  KJ_LOG(ERROR, "preparing uvTimer: ", timeout);
   UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
 }
 
 
 bool UvEventPort::wait() {
-  KJ_LOG(ERROR, "wait");
   scheduleTimers();
 
   //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
@@ -220,24 +222,28 @@ bool UvEventPort::wait() {
     
   timerImpl.advanceTo(clock.now());
 
-  // TODO(someday): Implement cross-thread wakeup.
+  if (woken) {
+    woken = false;
+    return true;
+  }
   return false;
  
 }
 
 bool UvEventPort::poll() {
-  KJ_LOG(ERROR, "poll");
   scheduleTimers();
   UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
 
   timerImpl.advanceTo(clock.now());
 
-  // TODO(someday): Implement cross-thread wakeup.
+  if (woken) {
+    woken = false;
+    return true;
+  }
   return false;
 }
 
 void UvEventPort::wake() const {
-  KJ_LOG(ERROR, "waking");
   uint64_t one = 1;
   ssize_t n;
   KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
@@ -245,19 +251,16 @@ void UvEventPort::wake() const {
 }
 
 void UvEventPort::setRunnable(bool runnable) {
-  KJ_LOG(ERROR, "setRunnable", kjLoop.isRunnable());
   if (runnable && !scheduled) {
-    KJ_LOG(ERROR, "setRunnable: scheduling", scheduled);
     schedule();
   }
 }
 
 void UvEventPort::run() {
-  KJ_LOG(ERROR, "run", scheduled, kjLoop.isRunnable());
-
   // stop scheduling
   KJ_ASSERT(scheduled);
   UV_CALL(uv_timer_stop(&uvWakeup), loop);
+  // TODO is cancelling the timer necessary?
   scheduled = false;
 
   if (kjLoop.isRunnable()) {
@@ -284,7 +287,7 @@ static constexpr uint NEW_FD_FLAGS =
 class OwnedFileDescriptor {
 public:
   OwnedFileDescriptor(uv_loop_t* loop, int fd, uint flags)
-      : uvLoop(loop), fd(applyFlags(fd, flags)), flags(flags),
+    : uvLoop(loop), fd(applyFlags(fd, flags)), flags(flags),
         uvPoller(uv_poll_init, uvLoop, fd) {
     uvPoller->data = this;
     UV_CALL(uv_poll_start(uvPoller, 0, &pollCallback), uvLoop);

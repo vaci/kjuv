@@ -9,12 +9,6 @@
 
 namespace kj {
 
-#define UV_CALL(code, loop, ...)                \
-  {                                             \
-    auto result = code;                                         \
-    KJ_ASSERT(result == 0, uv_strerror(result), ##__VA_ARGS__); \
-  }
-
 class UvEventPort: public kj::EventPort {
 
  public:
@@ -31,6 +25,9 @@ class UvEventPort: public kj::EventPort {
 
 private:
   uv_loop_t* loop;
+  kj::EventLoop kjLoop;
+  const kj::MonotonicClock& clock;
+  TimerImpl timerImpl;
 
   uv_timer_t uvTimer;
   // fires when the next timer event is ready
@@ -38,14 +35,12 @@ private:
   uv_timer_t uvWakeup;
   // fires when the KJ event loop is runnable
   
-  kj::EventLoop kjLoop;
-  bool scheduled = false;
-
   kj::AutoCloseFd eventFd;
   uv_poll_t eventHandle;
+  bool woken = false;
+  // true if a cross-thread event occurred
 
-  const kj::MonotonicClock& clock{kj::systemPreciseMonotonicClock()};
-  TimerImpl timerImpl{clock.now()};
+  bool scheduled = false;
 
   void schedule();
   void run();
@@ -60,5 +55,4 @@ private:
 
 kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(UvEventPort& eventPort);
 
-//kj::Own<kj::AsyncIoProvider> newAsyncIoProvider(kj::LowLevelAsyncIoProvider& lowLevel);
 }
