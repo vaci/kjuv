@@ -141,9 +141,23 @@ static int applyFlags(int fd, uint flags) {
   return fd;
 }
 
+void UvEventPort::doRun(uv_timer_t* handle) {
+  KJ_LOG(ERROR, "doRun");
+  KJ_ASSERT(handle != nullptr);
+  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
+  self->run();
+}
+
+void UvEventPort::doTimer(uv_timer_t* timer)  {
+  KJ_LOG(ERROR, "doTimer");
+  auto* self = reinterpret_cast<UvEventPort*>(timer->data);
+  self->timerImpl.advanceTo(self->clock.now());
+  self->timeout();
+}
+
 void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
   KJ_LOG(ERROR, "doEventFd");
-  UvEventPort* self = reinterpret_cast<UvEventPort*>(handle->data);
+  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   uint64_t value;
   ssize_t n;
   KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
@@ -155,8 +169,14 @@ void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
 UvEventPort::UvEventPort(uv_loop_t* loop)
   : loop(loop),
     kjLoop(*this) {
-  uv_timer_init(loop, &timer);
-  timer.data = this;
+  uv_timer_init(loop, &uvScheduleTimer);
+  uvScheduleTimer.data = this;
+
+  uv_timer_init(loop, &uvTimer);
+  uvTimer.data = this;
+
+  KJ_LOG(ERROR, "Initial timer");
+  timeout();
 
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
@@ -167,23 +187,88 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
   UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd), loop);
 }
 
+void UvEventPort::schedule() {
+  KJ_LOG(ERROR, "Scheduling...");
+  scheduled = true;
+  UV_CALL(uv_timer_start(&uvScheduleTimer, &doRun, 0, 0), loop);
+}
+
+void UvEventPort::timeout() {
+  KJ_LOG(ERROR, "cancelling uvTimer");
+  UV_CALL(uv_timer_stop(&uvTimer), loop);
+  
+  auto timeout = timerImpl.timeoutToNextEvent(clock.now(), kj::MILLISECONDS, uint64_t(maxValue)).orDefault(uint64_t(maxValue));
+
+  KJ_LOG(ERROR, "preparing uvTimer: ", timeout);
+  UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
+}
+
 UvEventPort::~UvEventPort() {
   if (scheduled) {
-    UV_CALL(uv_timer_stop(&timer), loop);
+    UV_CALL(uv_timer_stop(&uvScheduleTimer), loop);
   }
 
+  UV_CALL(uv_timer_stop(&uvTimer), loop);
+
   UV_CALL(uv_poll_stop(&eventHandle), loop);
+}
+
+bool UvEventPort::wait() {
+  KJ_LOG(ERROR, "wait");
+  timeout();
+
+  //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
+  uv_run(loop, UV_RUN_ONCE);
+    
+  timerImpl.advanceTo(clock.now());
+
+  // TODO(someday): Implement cross-thread wakeup.
+  return false;
+ 
+}
+
+bool UvEventPort::poll() {
+  KJ_LOG(ERROR, "poll");
+  timeout();
+  UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
+
+  timerImpl.advanceTo(clock.now());
+
+  // TODO(someday): Implement cross-thread wakeup.
+  return false;
+}
+
+void UvEventPort::wake() const {
+  KJ_LOG(ERROR, "waking");
+  uint64_t one = 1;
+  ssize_t n;
+  KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
+  KJ_ASSERT(n < 0 || n == sizeof(one));
+}
+
+void UvEventPort::setRunnable(bool runnable) {
+  KJ_LOG(ERROR, "setRunnable", runnable, kjLoop.isRunnable(), this->runnable);
+  if (runnable != this->runnable) {
+    this->runnable = runnable;
+    if (runnable && !scheduled) {
+      KJ_LOG(ERROR, "setRunnable: scheduling", runnable, scheduled);
+      schedule();
+    }
+  }
 }
 
 void UvEventPort::run() {
   KJ_LOG(ERROR, "run", scheduled, runnable, kjLoop.isRunnable());
   KJ_ASSERT(scheduled);
 
-  UV_CALL(uv_timer_stop(&timer), loop);
+  UV_CALL(uv_timer_stop(&uvScheduleTimer), loop);
+
 
   if (runnable) {
     kjLoop.run();
   }
+
+  timeout();
 
   if (runnable) {
     // Apparently either we never became non-runnable, or we did but then became runnable again.
@@ -191,7 +276,8 @@ void UvEventPort::run() {
     // now.
     KJ_LOG(WARNING, "still runnable after kjLoop.run()?");
     schedule();
-  } else {
+  }
+  else {
     scheduled = false;
   }
 }
@@ -603,99 +689,16 @@ public:
 #endif
 
   kj::Timer& getTimer() override {
-    // TODO(soon):  Implement this.
-    KJ_FAIL_ASSERT("Timers not implemented.");
+    return eventPort.timerImpl;
   }
 
 private:
   UvEventPort& eventPort;
 };
 
-/*
-struct UvAsyncIoProvider
-  : kj::AsyncIoProvider {
-
-  UvAsyncIoProvider(UvLowLevelAsyncIoProvider& lowLevel)
-    : lowLevel_{lowLevel} {
-  }
-
-  
-  OneWayPipe newOneWayPipe() override {
-    int fds[2]{};
-    KJ_SYSCALL(pipe2(fds, O_NONBLOCK | O_CLOEXEC));
-    return kj::OneWayPipe {
-      lowLevel_.wrapInputFd(fds[0], NEW_FD_FLAGS),
-      lowLevel.wrapOutputFd(fds[1], NEW_FD_FLAGS)
-    };
-  }
-
-  TwoWayPipe newTwoWayPipe() override {
-    int fds[2]{};
-    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
-    return kj::TwoWayPipe { {
-      lowLevel_.wrapSocketFd(fds[0], NEW_FD_FLAGS),
-      lowLevel_.wrapSocketFd(fds[1], NEW_FD_FLAGS)
-    } };
-  }
-
-  kj::CapabilityPipe newCapabilityPipe() override {
-    int fds[2]{};
-    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
-    return kj::CapabilityPipe { {
-      lowLevel_.wrapUnixSocketFd(fds[0], NEW_FD_FLAGS),
-      lowLevel_.wrapUnixSocketFd(fds[1], NEW_FD_FLAGS)
-    } };
-  }
-
-  Network& getNetwork() override {
-    return network;
-  }
-
-  kj::PipeThread newPipeThread(
-      kj::Function<void(kj::AsyncIoProvider&, kj::AsyncIoStream&, kj::WaitScope&)> startFunc) override {
-    int fds[2]{};
-    int type = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-
-    KJ_SYSCALL(socketpair(AF_UNIX, type, 0, fds));
-
-    int threadFd = fds[1];
-    KJ_ON_SCOPE_FAILURE(close(threadFd));
-
-    auto pipe = lowLevel_.wrapSocketFd(fds[0], NEW_FD_FLAGS);
-
-    auto thread = kj::heap<kj::Thread>([threadFd, startFunc=kj::mv(startFunc)]() mutable {
-      UvEventPort eventPort;
-      kj::EventLoop eventLoop(eventPort);
-      kj::WaitScope waitScope(eventLoop);
-      UvLowLevelAsyncIoProvider lowLevel_{eventPort};
-      auto stream = lowLevel_.wrapSocketFd(threadFd, NEW_FD_FLAGS);
-      UvAsyncIoProvider ioProvider{lowLevel};
-      startFunc(ioProvider, *stream, waitScope);
-    });
-
-    return { kj::mv(thread), kj::mv(pipe) };
-  }
-
-  kj::Timer& getTimer() override { return lowLevel_.getTimer(); }
-
-private:
-  UvLowLevelAsyncIoProvider& lowLevel_;
-  SocketNetwork network;
-};
-*/
-
 kj::Own<kj::LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(kj::UvEventPort& eventPort) {
   return kj::heap<UvLowLevelAsyncIoProvider>(eventPort);
 }
-
-
-/*
-kj::Own<kj::AsyncIoProvider> newAsyncIoProvider(kj::LowLevelAsyncIoProvider& lowLevel) {
-  return kj::heap<UvAsyncIoProvider>(kj::downcast<UvLowLevelAsyncIoProvider>(lowLevel));
-}
-*/
 
 }
 

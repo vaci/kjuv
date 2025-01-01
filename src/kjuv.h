@@ -24,43 +24,17 @@ class UvEventPort: public kj::EventPort {
   kj::EventLoop& getKjLoop() { return kjLoop; }
   uv_loop_t* getUvLoop() { return loop; }
 
-  bool wait() override {
-    //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
-    uv_run(loop, UV_RUN_ONCE);
-
-    // TODO(someday): Implement cross-thread wakeup.
-    return false;
-  }
-
-  bool poll() override {
-    UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
-
-    // TODO(someday): Implement cross-thread wakeup.
-    return false;
-  }
-
-  void wake() const override {
-    KJ_LOG(ERROR, "waking");
-    uint64_t one = 1;
-    ssize_t n;
-    KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
-    KJ_ASSERT(n < 0 || n == sizeof(one));
-  }
-
-  void setRunnable(bool runnable) override {
-    KJ_LOG(ERROR, "setRunnable", runnable, kjLoop.isRunnable());
-    if (runnable != this->runnable) {
-      this->runnable = runnable;
-      if (runnable && !scheduled) {
-        KJ_LOG(ERROR, "setRunnable: scheduling", runnable, scheduled);
-        schedule();
-      }
-    }
-  }
+  bool wait() override;
+  bool poll() override;
+  void wake() const override;
+  void setRunnable(bool runnable) override;
 
 private:
   uv_loop_t* loop;
-  uv_timer_t timer;
+  uv_timer_t uvScheduleTimer;
+
+  uv_timer_t uvTimer;
+  
   kj::EventLoop kjLoop;
   bool runnable = false;
   bool scheduled = false;
@@ -68,21 +42,18 @@ private:
   kj::AutoCloseFd eventFd;
   uv_poll_t eventHandle;
 
-  void schedule() {
-    KJ_LOG(ERROR, "Scheduled");
-    scheduled = true;
-    UV_CALL(uv_timer_start(&timer, &doRun, 0, 0), loop);
-  }
+  const kj::MonotonicClock& clock{kj::systemPreciseMonotonicClock()};
+  TimerImpl timerImpl{clock.now()};
 
+  void schedule();
   void run();
+  void timeout();
 
-  static void doRun(uv_timer_t* handle) {
-    KJ_ASSERT(handle != nullptr);
-    UvEventPort* self = reinterpret_cast<UvEventPort*>(handle->data);
-    self->run();
-  }
-
+  static void doRun(uv_timer_t* handle);
+  static void doTimer(uv_timer_t* timer);
   static void doEventFd(uv_poll_t* handle, int status, int events);
+
+  friend class UvLowLevelAsyncIoProvider;
 };
 
 kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(UvEventPort& eventPort);
