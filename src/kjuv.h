@@ -40,9 +40,6 @@ private:
   bool woken = false;
   // true if a cross-thread event occurred
 
-  bool scheduled = false;
-
-  void schedule();
   void run();
   void scheduleTimers();
 

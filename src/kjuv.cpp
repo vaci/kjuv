@@ -112,7 +112,6 @@ private:
   }
 };
 
-
 static void setNonblocking(int fd) {
   int flags;
   KJ_SYSCALL(flags = fcntl(fd, F_GETFL));
@@ -186,7 +185,7 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
   uv_timer_init(loop, &uvWakeup);
   uvWakeup.data = this;
 
-  // cross-thread event fd
+  // cross-thread events
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
   eventFd = AutoCloseFd(fd);
@@ -196,14 +195,9 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
 }
 
 UvEventPort::~UvEventPort() {
-  UV_CALL(uv_timer_stop(&uvWakeup), loop);
-  UV_CALL(uv_timer_stop(&uvTimer), loop);
-  UV_CALL(uv_poll_stop(&eventHandle), loop);
-}
-
-void UvEventPort::schedule() {
-  scheduled = true;
-  UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
+  uv_timer_stop(&uvWakeup);
+  uv_timer_stop(&uvTimer);
+  uv_poll_stop(&eventHandle);
 }
 
 void UvEventPort::scheduleTimers() {  
@@ -213,11 +207,9 @@ void UvEventPort::scheduleTimers() {
   UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
 }
 
-
 bool UvEventPort::wait() {
   scheduleTimers();
 
-  //UV_CALL(uv_run(loop, UV_RUN_ONCE), loop);
   uv_run(loop, UV_RUN_ONCE);
     
   timerImpl.advanceTo(clock.now());
@@ -251,17 +243,13 @@ void UvEventPort::wake() const {
 }
 
 void UvEventPort::setRunnable(bool runnable) {
-  if (runnable && !scheduled) {
-    schedule();
+  if (runnable) {
+    UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
   }
 }
 
 void UvEventPort::run() {
-  // stop scheduling
-  KJ_ASSERT(scheduled);
   UV_CALL(uv_timer_stop(&uvWakeup), loop);
-  // TODO is cancelling the timer necessary?
-  scheduled = false;
 
   if (kjLoop.isRunnable()) {
     kjLoop.run();
@@ -272,7 +260,7 @@ void UvEventPort::run() {
   if (kjLoop.isRunnable()) {
     // Apparently either we never became non-runnable, or we did but then became runnable again.
     KJ_LOG(WARNING, "still runnable after kjLoop.run()?");
-    schedule();
+    setRunnable(true);
   }
 }
 
