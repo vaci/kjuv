@@ -189,15 +189,15 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
   eventFd = AutoCloseFd(fd);
-  uv_poll_init(loop, &eventHandle, eventFd);
-  eventHandle.data = this;
-  UV_CALL(uv_poll_start(&eventHandle, UV_READABLE, &doEventFd), loop);
+  uv_poll_init(loop, &uvEventFdPoller, eventFd);
+  uvEventFdPoller.data = this;
+  UV_CALL(uv_poll_start(&uvEventFdPoller, UV_READABLE, &doEventFd), loop);
 }
 
 UvEventPort::~UvEventPort() {
+  uv_poll_stop(&uvEventFdPoller);
   uv_timer_stop(&uvWakeup);
   uv_timer_stop(&uvTimer);
-  uv_poll_stop(&eventHandle);
 }
 
 void UvEventPort::scheduleTimers() {  
@@ -209,9 +209,7 @@ void UvEventPort::scheduleTimers() {
 
 bool UvEventPort::wait() {
   scheduleTimers();
-
   uv_run(loop, UV_RUN_ONCE);
-    
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -219,13 +217,11 @@ bool UvEventPort::wait() {
     return true;
   }
   return false;
- 
 }
 
 bool UvEventPort::poll() {
   scheduleTimers();
   UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
-
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -255,13 +251,12 @@ void UvEventPort::run() {
     kjLoop.run();
   }
 
-  scheduleTimers();
-
   if (kjLoop.isRunnable()) {
     // Apparently either we never became non-runnable, or we did but then became runnable again.
-    KJ_LOG(WARNING, "still runnable after kjLoop.run()?");
     setRunnable(true);
   }
+
+  scheduleTimers();
 }
 
 static constexpr uint NEW_FD_FLAGS =

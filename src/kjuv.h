@@ -36,7 +36,9 @@ private:
   // fires when the KJ event loop is runnable
   
   kj::AutoCloseFd eventFd;
-  uv_poll_t eventHandle;
+  uv_poll_t uvEventFdPoller;
+  // cross-thread event
+
   bool woken = false;
   // true if a cross-thread event occurred
 
