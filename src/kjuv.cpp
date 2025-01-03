@@ -179,7 +179,6 @@ UvEventPort::UvEventPort(uv_loop_t* loop)
   // timer events
   uv_timer_init(loop, &uvTimer);
   uvTimer.data = this;
-  scheduleTimers();
 
   // wakeup events
   uv_timer_init(loop, &uvWakeup);
@@ -255,8 +254,6 @@ void UvEventPort::run() {
     // Apparently either we never became non-runnable, or we did but then became runnable again.
     setRunnable(true);
   }
-
-  scheduleTimers();
 }
 
 static constexpr uint NEW_FD_FLAGS =
