@@ -4,25 +4,23 @@
 
 #include "kjuv.h"
 
+#include <kj/debug.h>
 #include <kj/main.h>
 
 #include <gtest/gtest.h>
 
-static int EKAM_TEST_DISABLE_INTERCEPTOR = 1;
-
 struct UvTest
   : testing::Test {
 
-  UvTest() {
-  }
-
-  ~UvTest() noexcept {
-  }
+  UvTest() {}
+  ~UvTest() noexcept {}
 
   uv_loop_t* uvLoop{uv_default_loop()};
   kj::UvEventPort eventPort{uvLoop};
   kj::EventLoop kjLoop{eventPort};
   kj::WaitScope waitScope{kjLoop};
+  kj::Own<kj::LowLevelAsyncIoProvider> lowLevel{kj::newUvLowLevelAsyncIoProvider(eventPort)};
+  kj::Own<kj::AsyncIoProvider> aio{kj::newAsyncIoProvider(*lowLevel)};
 };
 
 TEST_F(UvTest, Basic) {
@@ -38,18 +36,12 @@ TEST_F(UvTest, Reject) {
 }
 
 TEST_F(UvTest, Timer) {
-  auto lowLevel = kj::newUvLowLevelAsyncIoProvider(eventPort);
-  auto aio = kj::newAsyncIoProvider(*lowLevel);
-
   auto& timer = aio->getTimer();
   auto promise = timer.afterDelay(kj::NANOSECONDS*1);
   promise.wait(waitScope);
 }
 
 TEST_F(UvTest, TimerReschedule) {
-  auto lowLevel = kj::newUvLowLevelAsyncIoProvider(eventPort);
-  auto aio = kj::newAsyncIoProvider(*lowLevel);
-
   auto& timer = aio->getTimer();
   timer.afterDelay(kj::NANOSECONDS).then(
     [&timer]{
@@ -72,17 +64,13 @@ TEST_F(UvTest, CrossThreadFulfillerOtherThread) {
 }
 
 TEST_F(UvTest, PipeStream) {
-  auto lowLevel = kj::newUvLowLevelAsyncIoProvider(eventPort);
-  auto aio = kj::newAsyncIoProvider(*lowLevel);
+  constexpr auto txt = "hello, world"_kj;
   auto pipe = aio->newOneWayPipe();
-
-  auto pth = aio->newPipeThread([](auto& aio, auto& stream, auto& waitScope) {
-    constexpr auto txt = "hello"_kj;
+  auto pth = aio->newPipeThread([txt](auto&, auto& stream, auto& waitScope) {
     stream.write(txt.begin(), txt.size()).wait(waitScope);
   });
-
-  auto txt = pth.pipe->readAllText().wait(waitScope);
-  EXPECT_STREQ(txt.cStr(), "hello");
+  auto reply = pth.pipe->readAllText().wait(waitScope);
+  EXPECT_STREQ(reply.cStr(), txt.cStr());
 }
 
 int main(int argc, char* argv[]) {
