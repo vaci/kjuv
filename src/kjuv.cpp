@@ -24,15 +24,6 @@
 // Largely cribbed from 
 // https://github.com/capnproto/node-capnp/blob/node14/src/node-capnp/capnp.cc
 
-#if __cplusplus >= 201300
-// Hack around stdlib bug with C++14.
-#include <initializer_list>  // force libstdc++ to include its config
-#undef _GLIBCXX_HAVE_GETS    // correct broken config
-// End hack.
-#endif
-
-#include <capnp/dynamic.h>
-#include <capnp/schema-parser.h>
 #include <kj/debug.h>
 #include <kj/async.h>
 #include <kj/async-io.h>
@@ -40,16 +31,10 @@
 #include <kj/vector.h>
 
 #include <errno.h>
-#include <inttypes.h>
 #include <stdlib.h>
 #include <sys/uio.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-
-#include <set>
-#include <typeinfo>
-#include <typeindex>
-#include <unordered_map>
 
 namespace kj {
 
@@ -431,12 +416,10 @@ public:
     KJ_SYSCALL(shutdown(fd, SHUT_WR));
   }
 
-#if CAPNP_VERSION >= 8000
   kj::Promise<void> whenWriteDisconnected() override {
     // TODO(someday): Implement using UV_DISCONNECT?
     return kj::NEVER_DONE;
   }
-#endif
 
 private:
   kj::Promise<size_t> tryReadInternal(void* buffer, size_t minBytes, size_t maxBytes,
@@ -649,18 +632,12 @@ public:
     });
   }
 
-#if CAPNP_VERSION < 7000
-  kj::Own<kj::ConnectionReceiver> wrapListenSocketFd(int fd, uint flags = 0) override {
-    return kj::heap<UvConnectionReceiver>(eventPort.getUvLoop(), fd, flags);
-  }
-#else
   kj::Own<kj::ConnectionReceiver> wrapListenSocketFd(int fd,
       kj::LowLevelAsyncIoProvider::NetworkFilter& filter, uint flags = 0) override {
     // TODO(soon): TODO(security): Actually use `filter`. Currently no API is exposed to set a
     //   filter so it's not important yet.
     return kj::heap<UvConnectionReceiver>(eventPort.getUvLoop(), fd, flags);
   }
-#endif
 
   kj::Timer& getTimer() override {
     return eventPort.timerImpl;

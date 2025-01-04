@@ -2,7 +2,6 @@
 
 #include <kj/async.h>
 #include <kj/async-io.h>
-#include <kj/debug.h>
 #include <kj/io.h>
 
 #include <uv.h>
