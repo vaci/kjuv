@@ -1,6 +1,5 @@
 #pragma once
 
-#include <kj/async.h>
 #include <kj/async-io.h>
 #include <kj/io.h>
 
@@ -10,12 +9,14 @@ namespace kj {
 
 class UvEventPort: public kj::EventPort {
 
+  struct Impl;
+  
  public:
   UvEventPort(uv_loop_t* loop);
   ~UvEventPort();
  
   kj::EventLoop& getKjLoop() { return kjLoop; }
-  uv_loop_t* getUvLoop() { return loop; }
+  uv_loop_t* getUvLoop() { return uvLoop; }
 
   bool wait() override;
   bool poll() override;
@@ -23,30 +24,9 @@ class UvEventPort: public kj::EventPort {
   void setRunnable(bool runnable) override;
 
 private:
-  uv_loop_t* loop;
+  uv_loop_t* uvLoop;
   kj::EventLoop kjLoop;
-  const kj::MonotonicClock& clock;
-  TimerImpl timerImpl;
-
-  uv_timer_t uvTimer;
-  // fires when the next timer event is ready
-
-  uv_timer_t uvWakeup;
-  // fires when the KJ event loop is runnable
-  
-  kj::AutoCloseFd eventFd;
-  uv_poll_t uvEventFdPoller;
-  // cross-thread event
-
-  bool woken = false;
-  // true if a cross-thread event occurred
-
-  void run();
-  void scheduleTimers();
-
-  static void doRun(uv_timer_t* handle);
-  static void doTimer(uv_timer_t* timer);
-  static void doEventFd(uv_poll_t* handle, int status, int events);
+  kj::Own<Impl> impl;
 
   friend class UvLowLevelAsyncIoProvider;
 };
