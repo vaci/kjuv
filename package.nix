@@ -35,11 +35,13 @@ in stdenv.mkDerivation {
 
   buildPhase = ''
     ${create-ekam-rules-link}
-    make ${if debug then "debug" else "release"}
+    #make ${if debug then "debug" else "release"}
+    make lib
   '';
 
   installPhase = ''
     mkdir --parents $out/lib $out/include
-    cp icat $out/bin
+    cp libkjuv.a  $out/lib
+    cp src/kjuv.h $out/include
   '';
 }
