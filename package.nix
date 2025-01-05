@@ -6,7 +6,7 @@
   , stdenv
   , which
 
-  , debug ? true
+  , debug ? false
 }:
 
 let
@@ -21,9 +21,6 @@ in stdenv.mkDerivation {
   name = "kjuv";
   src = ./.;
 
-  CXXFLAGS = "-ggdb --std=c++20 -DCAPNP_INCLUDE_PATH=${capnproto}/include";
-
- 
   buildInputs = [
     capnproto
     libuv
@@ -32,7 +29,6 @@ in stdenv.mkDerivation {
   nativeBuildInputs = [
     ekam
     gtest 
-    which
   ];
 
   shellHook = create-ekam-rules-link;
@@ -40,5 +36,10 @@ in stdenv.mkDerivation {
   buildPhase = ''
     ${create-ekam-rules-link}
     make ${if debug then "debug" else "release"}
+  '';
+
+  installPhase = ''
+    mkdir --parents $out/lib $out/include
+    cp icat $out/bin
   '';
 }

@@ -3,5 +3,5 @@
 }:
 
 {
-  pykj = pkgs.callPackage ./package.nix {};
+  kjuv = pkgs.callPackage ./package.nix {};
 }
