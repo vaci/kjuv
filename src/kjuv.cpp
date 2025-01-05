@@ -132,68 +132,152 @@ static int applyFlags(int fd, uint flags) {
   return fd;
 }
 
-void UvEventPort::doRun(uv_timer_t* handle) {
+static kj::AutoCloseFd openEventFd() {
+  int fd;
+  KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+  return AutoCloseFd(fd);
+}
+
+struct UvEventPort::Impl {
+
+  Impl(UvEventPort& eventPort);
+  ~Impl();
+
+  void scheduleRunnable();
+  static void doRun(uv_timer_t* handle);
+  void run();
+
+  void scheduleTimers();
+  static void doTimer(uv_timer_t* timer);
+  void fireTimers();
+
+  void scheduleWakeup() const;
+  static void doWakeup(uv_poll_t* handle, int status, int events);
+  void fireWakeup();
+
+  bool wait();
+  bool poll();
+
+  UvEventPort& eventPort;
+  const kj::MonotonicClock& clock;
+  TimerImpl timerImpl;
+
+  UvHandle<uv_timer_t> uvTimer;
+  // fires when the next timer event is ready
+
+  UvHandle<uv_timer_t> uvRunnable;
+  // fires when the KJ event loop is to be run
+
+  AutoCloseFd eventFd;
+  UvHandle<uv_poll_t> uvEventFdPoller;
+  // cross-thread event
+
+  bool woken = false;
+  // true if a cross-thread event occurred
+};
+
+UvEventPort::Impl::Impl(UvEventPort& eventPort)
+  : eventPort(eventPort),
+    clock(kj::systemPreciseMonotonicClock()),
+    timerImpl(clock.now()),
+    uvTimer(uv_timer_init, eventPort.getUvLoop()),
+    uvRunnable(uv_timer_init, eventPort.getUvLoop()),
+    eventFd(openEventFd()),
+    uvEventFdPoller(uv_poll_init, eventPort.getUvLoop(), eventFd) {
+
+  uvTimer->data = this;
+  uvRunnable->data = this;
+  uvEventFdPoller->data = this;
+
+  UV_CALL(uv_poll_start(uvEventFdPoller, UV_READABLE, &doWakeup), eventPort.getUvLoop());
+}
+
+UvEventPort::Impl::~Impl() {
+  uv_poll_stop(uvEventFdPoller);
+  uv_timer_stop(uvRunnable);
+  uv_timer_stop(uvTimer);
+}
+
+void UvEventPort::Impl::scheduleRunnable() {
+  UV_CALL(uv_timer_start(uvRunnable, &doRun, 0, 0), eventPort.getUvLoop());
+}
+
+void UvEventPort::Impl::doRun(uv_timer_t* handle) {
   KJ_ASSERT(handle != nullptr);
-  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
+  auto* self = reinterpret_cast<UvEventPort::Impl*>(handle->data);
   self->run();
 }
 
-void UvEventPort::doTimer(uv_timer_t* handle)  {
-  KJ_ASSERT(handle != nullptr);
-  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
-  self->timerImpl.advanceTo(self->clock.now());
-  self->scheduleTimers();
+void UvEventPort::Impl::run() {
+  UV_CALL(uv_timer_stop(uvRunnable), loop);
+
+  if (eventPort.kjLoop.isRunnable()) {
+    eventPort.kjLoop.run();
+  }
+
+  if (eventPort.kjLoop.isRunnable()) {
+    // Apparently either we never became non-runnable, or we did but then became runnable again.
+    eventPort.setRunnable(true);
+  }
 }
 
-void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
-  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
-  uint64_t value;
-  ssize_t n;
-  KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
-  KJ_ASSERT(n < 0 || n == sizeof(value));
-  self->woken = true;
-  self->setRunnable(true);
-}
-
-UvEventPort::UvEventPort(uv_loop_t* loop)
-  : loop(loop),
-    kjLoop(*this),
-    clock{kj::systemPreciseMonotonicClock()},
-    timerImpl{clock.now()} {
-
-  // timer events
-  uv_timer_init(loop, &uvTimer);
-  uvTimer.data = this;
-
-  // wakeup events
-  uv_timer_init(loop, &uvWakeup);
-  uvWakeup.data = this;
-
-  // cross-thread events
-  int fd;
-  KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-  eventFd = AutoCloseFd(fd);
-  uv_poll_init(loop, &uvEventFdPoller, eventFd);
-  uvEventFdPoller.data = this;
-  UV_CALL(uv_poll_start(&uvEventFdPoller, UV_READABLE, &doEventFd), loop);
-}
-
-UvEventPort::~UvEventPort() {
-  uv_poll_stop(&uvEventFdPoller);
-  uv_timer_stop(&uvWakeup);
-  uv_timer_stop(&uvTimer);
-}
-
-void UvEventPort::scheduleTimers() {  
+void UvEventPort::Impl::scheduleTimers() {  
   auto timeout = timerImpl.timeoutToNextEvent(
     clock.now(), kj::MILLISECONDS, uint64_t(maxValue)
   ).orDefault(uint64_t(maxValue));
-  UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
+  UV_CALL(uv_timer_start(uvTimer, &doTimer, timeout, 0), eventPort.getUvLoop());
+}
+
+void UvEventPort::Impl::doTimer(uv_timer_t* handle)  {
+  KJ_ASSERT(handle != nullptr);
+  auto* self = reinterpret_cast<UvEventPort::Impl*>(handle->data);
+  self->fireTimers();
+}
+
+void UvEventPort::Impl::fireTimers() {
+  timerImpl.advanceTo(clock.now());
+  scheduleTimers();
+}
+
+void UvEventPort::Impl::scheduleWakeup() const {
+  uint64_t one = 1;
+  ssize_t n;
+  KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
+  KJ_ASSERT(n < 0 || n == sizeof(one));
+}
+
+void UvEventPort::Impl::doWakeup(uv_poll_t* handle, int status, int events)  {
+  KJ_ASSERT(handle != nullptr);
+  auto* self = reinterpret_cast<UvEventPort::Impl*>(handle->data);
+  self->fireWakeup();
+}
+
+void UvEventPort::Impl::fireWakeup() {
+  uint64_t value;
+  ssize_t n;
+  KJ_NONBLOCKING_SYSCALL(n = read(eventFd, &value, sizeof(value)));
+  KJ_ASSERT(n < 0 || n == sizeof(value));
+  woken = true;
+  eventPort.setRunnable(true);
+}
+
+
+UvEventPort::UvEventPort(uv_loop_t* loop)
+  : uvLoop(loop),
+    kjLoop(*this),
+    impl(kj::heap<Impl>(*this)) {
+}
+
+UvEventPort::~UvEventPort() {
 }
 
 bool UvEventPort::wait() {
+  return impl->wait();
+}
+
+bool UvEventPort::Impl::wait() {
   scheduleTimers();
-  uv_run(loop, UV_RUN_ONCE);
+  uv_run(eventPort.uvLoop, UV_RUN_ONCE);
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -204,8 +288,12 @@ bool UvEventPort::wait() {
 }
 
 bool UvEventPort::poll() {
+  return impl->poll();
+}
+
+bool UvEventPort::Impl::poll() {
   scheduleTimers();
-  UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
+  UV_CALL(uv_run(eventPort.uvLoop, UV_RUN_NOWAIT), eventPort.getUvLoop());
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -216,28 +304,12 @@ bool UvEventPort::poll() {
 }
 
 void UvEventPort::wake() const {
-  uint64_t one = 1;
-  ssize_t n;
-  KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
-  KJ_ASSERT(n < 0 || n == sizeof(one));
+  impl->scheduleWakeup();
 }
 
 void UvEventPort::setRunnable(bool runnable) {
   if (runnable) {
-    UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
-  }
-}
-
-void UvEventPort::run() {
-  UV_CALL(uv_timer_stop(&uvWakeup), loop);
-
-  if (kjLoop.isRunnable()) {
-    kjLoop.run();
-  }
-
-  if (kjLoop.isRunnable()) {
-    // Apparently either we never became non-runnable, or we did but then became runnable again.
-    setRunnable(true);
+    impl->scheduleRunnable();
   }
 }
 
@@ -640,7 +712,7 @@ public:
   }
 
   kj::Timer& getTimer() override {
-    return eventPort.timerImpl;
+    return eventPort.impl->timerImpl;
   }
 
 private:
