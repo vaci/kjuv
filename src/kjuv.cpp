@@ -24,7 +24,6 @@
 // Largely cribbed from 
 // https://github.com/capnproto/node-capnp/blob/node14/src/node-capnp/capnp.cc
 
-#include <kj/debug.h>
 #include <kj/async.h>
 #include <kj/async-io.h>
 #include <kj/io.h>
@@ -41,61 +40,12 @@ namespace kj {
 // =======================================================================================
 // KJ <-> libuv glue.
 
-#define UV_CALL(code, loop, ...)                \
+#define UV_CALL(code, ...)                \
   {                                             \
-    auto result = code;                                         \
+    auto result = (code);                                       \
     KJ_ASSERT(result == 0, uv_strerror(result), ##__VA_ARGS__); \
   }
 
-template <typename HandleType>
-class UvHandle {
-  // Encapsulates libuv handle lifetime into C++ object lifetime. This turns out to be hard.
-  // If the loop is no longer running, memory will leak.
-  //
-  // Use like:
-  //   UvHandle<uv_timer_t> timer(uv_timer_init, loop);
-  //   uv_timer_start(timer, &callback, 0, 0);
-
-public:
-  template <typename ConstructorFunc, typename... Args>
-  UvHandle(ConstructorFunc&& func, uv_loop_t* loop, Args&&... args): handle(new HandleType) {
-    auto result = func(loop, handle, kj::fwd<Args>(args)...);
-    if (result < 0) {
-      delete handle;
-      auto error = uv_strerror(result);
-      KJ_FAIL_ASSERT("creating UV handle failed", error);
-    }
-  }
-
-  ~UvHandle() {
-    uv_close(getBase(), &closeCallback);
-  }
-
-  inline HandleType& operator*() { return *handle; }
-  inline const HandleType& operator*() const { return *handle; }
-
-  inline HandleType* operator->() { return handle; }
-  inline HandleType* operator->() const { return handle; }
-
-  inline operator HandleType*() { return handle; }
-  inline operator const HandleType*() const { return handle; }
-
-  inline operator uv_handle_t*() { return reinterpret_cast<uv_handle_t*>(handle); }
-  inline operator const uv_handle_t*() const { return reinterpret_cast<uv_handle_t*>(handle); }
-
-  inline HandleType* get() { return handle; }
-  inline HandleType* get() const { return handle; }
-
-  inline uv_handle_t* getBase() { return reinterpret_cast<uv_handle_t*>(handle); }
-  inline uv_handle_t* getBase() const { return reinterpret_cast<uv_handle_t*>(handle); }
-
-private:
-  HandleType* handle;
-
-  static void closeCallback(uv_handle_t* handle) {
-    delete reinterpret_cast<HandleType*>(handle);
-  }
-};
 
 static void setNonblocking(int fd) {
   int flags;
@@ -132,68 +82,82 @@ static int applyFlags(int fd, uint flags) {
   return fd;
 }
 
-void UvEventPort::doRun(uv_timer_t* handle) {
-  KJ_ASSERT(handle != nullptr);
+static kj::AutoCloseFd openEventFd() {
+  int fd;
+  KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+  return AutoCloseFd(fd);
+}
+
+UvEventPort::UvEventPort(uv_loop_t* loop, const kj::MonotonicClock& clock)
+  : uvLoop{loop}
+  , kjLoop{*this}
+  , clock{clock}
+  , timerImpl(clock.now())
+  , uvTimer(uv_timer_init, uvLoop)
+  , uvRunnable(uv_idle_init, uvLoop)
+  , uvWake(uv_async_init, uvLoop, &doWakeup) {
+
+  uvTimer->data = this;
+  uvRunnable->data = this;
+  uvWake->data = this;
+}
+
+UvEventPort::~UvEventPort() {
+  uv_timer_stop(uvTimer);
+}
+
+void UvEventPort::doRun(uv_idle_t* handle) {
+  KJ_DASSERT(handle != nullptr);
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->run();
 }
 
-void UvEventPort::doTimer(uv_timer_t* handle)  {
-  KJ_ASSERT(handle != nullptr);
-  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
-  self->timerImpl.advanceTo(self->clock.now());
-  self->scheduleTimers();
+void UvEventPort::run() {
+  setRunnable(false);
+
+  if (kjLoop.isRunnable()) {
+    kjLoop.run();
+  }
+
+  if (kjLoop.isRunnable()) {
+    // Apparently either we never became non-runnable,
+    // or we did but then became runnable again.
+    setRunnable(true);
+  }
 }
 
-void UvEventPort::doEventFd(uv_poll_t* handle, int status, int events)  {
-  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
-  uint64_t value;
-  ssize_t n;
-  KJ_NONBLOCKING_SYSCALL(n = read(self->eventFd, &value, sizeof(value)));
-  KJ_ASSERT(n < 0 || n == sizeof(value));
-  self->woken = true;
-  self->setRunnable(true);
-}
-
-UvEventPort::UvEventPort(uv_loop_t* loop)
-  : loop(loop),
-    kjLoop(*this),
-    clock{kj::systemPreciseMonotonicClock()},
-    timerImpl{clock.now()} {
-
-  // timer events
-  uv_timer_init(loop, &uvTimer);
-  uvTimer.data = this;
-
-  // wakeup events
-  uv_timer_init(loop, &uvWakeup);
-  uvWakeup.data = this;
-
-  // cross-thread events
-  int fd;
-  KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-  eventFd = AutoCloseFd(fd);
-  uv_poll_init(loop, &uvEventFdPoller, eventFd);
-  uvEventFdPoller.data = this;
-  UV_CALL(uv_poll_start(&uvEventFdPoller, UV_READABLE, &doEventFd), loop);
-}
-
-UvEventPort::~UvEventPort() {
-  uv_poll_stop(&uvEventFdPoller);
-  uv_timer_stop(&uvWakeup);
-  uv_timer_stop(&uvTimer);
-}
-
-void UvEventPort::scheduleTimers() {  
+void UvEventPort::scheduleTimers() {
   auto timeout = timerImpl.timeoutToNextEvent(
     clock.now(), kj::MILLISECONDS, uint64_t(maxValue)
   ).orDefault(uint64_t(maxValue));
-  UV_CALL(uv_timer_start(&uvTimer, &doTimer, timeout, 0), loop);
+  UV_CALL(uv_timer_start(uvTimer, &doTimer, timeout, 0));
+}
+
+void UvEventPort::doTimer(uv_timer_t* handle)  {
+  KJ_DASSERT(handle != nullptr);
+  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
+  self->fireTimers();
+}
+
+void UvEventPort::fireTimers() {
+  timerImpl.advanceTo(clock.now());
+  scheduleTimers();
+}
+
+void UvEventPort::doWakeup(uv_async_t* handle)  {
+  KJ_DASSERT(handle != nullptr);
+  auto* self = reinterpret_cast<UvEventPort*>(handle->data);
+  self->fireWakeup();
+}
+
+void UvEventPort::fireWakeup() {
+  woken = true;
+  setRunnable(true);
 }
 
 bool UvEventPort::wait() {
   scheduleTimers();
-  uv_run(loop, UV_RUN_ONCE);
+  uv_run(uvLoop, UV_RUN_ONCE);
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -205,7 +169,7 @@ bool UvEventPort::wait() {
 
 bool UvEventPort::poll() {
   scheduleTimers();
-  UV_CALL(uv_run(loop, UV_RUN_NOWAIT), loop);
+  UV_CALL(uv_run(uvLoop, UV_RUN_NOWAIT));
   timerImpl.advanceTo(clock.now());
 
   if (woken) {
@@ -216,38 +180,26 @@ bool UvEventPort::poll() {
 }
 
 void UvEventPort::wake() const {
-  uint64_t one = 1;
-  ssize_t n;
-  KJ_NONBLOCKING_SYSCALL(n = write(eventFd, &one, sizeof(one)));
-  KJ_ASSERT(n < 0 || n == sizeof(one));
+  uv_async_send(uvWake);
 }
 
 void UvEventPort::setRunnable(bool runnable) {
   if (runnable) {
-    UV_CALL(uv_timer_start(&uvWakeup, &doRun, 0, 0), loop);
+    UV_CALL(uv_idle_start(uvRunnable, &doRun));
   }
-}
-
-void UvEventPort::run() {
-  UV_CALL(uv_timer_stop(&uvWakeup), loop);
-
-  if (kjLoop.isRunnable()) {
-    kjLoop.run();
-  }
-
-  if (kjLoop.isRunnable()) {
-    // Apparently either we never became non-runnable, or we did but then became runnable again.
-    setRunnable(true);
+  else {
+    UV_CALL(uv_idle_stop(uvRunnable));
   }
 }
 
 static constexpr uint NEW_FD_FLAGS =
 #if __linux__
-    kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC | kj::LowLevelAsyncIoProvider::ALREADY_NONBLOCK |
+  kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC |
+  kj::LowLevelAsyncIoProvider::ALREADY_NONBLOCK |
 #endif
-    kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP;
-// We always try to open FDs with CLOEXEC and NONBLOCK already set on Linux, but on other platforms
-// this is not possible.
+  kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP;
+// We always try to open FDs with CLOEXEC and NONBLOCK already set on Linux,
+// but on other platforms this is not possible.
 
 class OwnedFileDescriptor {
 public:
@@ -255,12 +207,12 @@ public:
     : uvLoop(loop), fd(applyFlags(fd, flags)), flags(flags),
         uvPoller(uv_poll_init, uvLoop, fd) {
     uvPoller->data = this;
-    UV_CALL(uv_poll_start(uvPoller, 0, &pollCallback), uvLoop);
+    UV_CALL(uv_poll_start(uvPoller, 0, &pollCallback));
   }
 
   ~OwnedFileDescriptor() noexcept(false) {
     if (!stopped) {
-      UV_CALL(uv_poll_stop(uvPoller), uvLoop);
+      UV_CALL(uv_poll_stop(uvPoller));
     }
 
     // Don't use KJ_SYSCALL() here because close() should not be repeated on EINTR.
@@ -281,7 +233,7 @@ public:
     readable = kj::mv(paf.fulfiller);
 
     int flags = UV_READABLE | (writable == nullptr ? 0 : UV_WRITABLE);
-    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback), uvLoop);
+    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
 
     return kj::mv(paf.promise);
   }
@@ -295,7 +247,7 @@ public:
     writable = kj::mv(paf.fulfiller);
 
     int flags = UV_WRITABLE | (readable == nullptr ? 0 : UV_READABLE);
-    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback), uvLoop);
+    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
 
     return kj::mv(paf.promise);
   }
@@ -348,7 +300,7 @@ private:
       // Update the poll flags.
       int flags = (readable == nullptr ? 0 : UV_READABLE) |
                   (writable == nullptr ? 0 : UV_WRITABLE);
-      UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback), uvLoop);
+      UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
     }
   }
 };

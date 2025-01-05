@@ -1,21 +1,63 @@
 #pragma once
 
-#include <kj/async.h>
 #include <kj/async-io.h>
+#include <kj/debug.h>
 #include <kj/io.h>
 
 #include <uv.h>
 
 namespace kj {
 
-class UvEventPort: public kj::EventPort {
+template <typename HandleType>
+class UvHandle {
+  // Encapsulates libuv handle lifetime into C++ object lifetime. This turns out to be hard.
+  // If the loop is no longer running, memory will leak.
+  //
+  // Use like:
+  //   UvHandle<uv_timer_t> timer(uv_timer_init, loop);
+  //   uv_timer_start(timer, &callback, 0, 0);
+
+public:
+  template <typename Init, typename... Args>
+  UvHandle(Init&& func, uv_loop_t* loop, Args&&... args)
+    : handle{new HandleType} {
+
+    auto result = kj::fwd<Init>(func)(loop, handle, kj::fwd<Args>(args)...);
+    if (result < 0) {
+      delete handle;
+      auto error = uv_strerror(result);
+      KJ_FAIL_ASSERT("creating UV handle failed", error);
+    }
+  }
+
+  ~UvHandle() {
+    uv_close(reinterpret_cast<uv_handle_t*>(handle), &closeCallback);
+  }
+
+  inline HandleType* operator->() { return handle; }
+  inline operator HandleType*() { return handle; }
+  inline operator uv_handle_t*() { return reinterpret_cast<uv_handle_t*>(handle); }
+
+private:
+  HandleType* handle;
+
+  static void closeCallback(uv_handle_t* handle) {
+    delete reinterpret_cast<HandleType*>(handle);
+  }
+};
+
+class UvEventPort
+  : public kj::EventPort {
 
  public:
-  UvEventPort(uv_loop_t* loop);
+  UvEventPort(
+    uv_loop_t* loop,
+    const kj::MonotonicClock& = kj::systemPreciseMonotonicClock());
+
   ~UvEventPort();
- 
+
   kj::EventLoop& getKjLoop() { return kjLoop; }
-  uv_loop_t* getUvLoop() { return loop; }
+  uv_loop_t* getUvLoop() { return uvLoop; }
 
   bool wait() override;
   bool poll() override;
@@ -23,34 +65,38 @@ class UvEventPort: public kj::EventPort {
   void setRunnable(bool runnable) override;
 
 private:
-  uv_loop_t* loop;
+  uv_loop_t* uvLoop;
   kj::EventLoop kjLoop;
+
+  static void doRun(uv_idle_t* handle);
+  void run();
+
+  void scheduleTimers();
+  static void doTimer(uv_timer_t* timer);
+  void fireTimers();
+
+  static void doWakeup(uv_async_t* handle);
+  void fireWakeup();
+
   const kj::MonotonicClock& clock;
   TimerImpl timerImpl;
 
-  uv_timer_t uvTimer;
+  UvHandle<uv_timer_t> uvTimer;
   // fires when the next timer event is ready
 
-  uv_timer_t uvWakeup;
-  // fires when the KJ event loop is runnable
-  
-  kj::AutoCloseFd eventFd;
-  uv_poll_t uvEventFdPoller;
+  UvHandle<uv_idle_t> uvRunnable;
+  // fires when the KJ event loop is to be run
+
+  mutable UvHandle<uv_async_t> uvWake;
   // cross-thread event
 
   bool woken = false;
   // true if a cross-thread event occurred
 
-  void run();
-  void scheduleTimers();
-
-  static void doRun(uv_timer_t* handle);
-  static void doTimer(uv_timer_t* timer);
-  static void doEventFd(uv_poll_t* handle, int status, int events);
-
   friend class UvLowLevelAsyncIoProvider;
 };
 
-kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(UvEventPort& eventPort);
+kj::Own<LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(
+  UvEventPort& eventPort);
 
 }

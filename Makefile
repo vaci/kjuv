@@ -30,6 +30,9 @@ debug-continuous release-continuous: EKAM_FLAGS += -c
 debug debug-continuous release release-continuous:
 	nice ekam $(EKAM_FLAGS)
 
+lib: release
+	ar r libkjuv.a tmp/kjuv.o
+
 clean:
 	rm -fr bin tmp
 
