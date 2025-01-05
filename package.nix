@@ -1,5 +1,6 @@
 {
-    capnproto
+  capnproto
+    , cmake
   , ekam
   , gtest
   , libuv
@@ -27,6 +28,7 @@ in stdenv.mkDerivation {
   ];
 
   nativeBuildInputs = [
+    cmake
     ekam
     gtest 
   ];
@@ -36,10 +38,12 @@ in stdenv.mkDerivation {
   buildPhase = ''
     ${create-ekam-rules-link}
     make ${if debug then "debug" else "release"}
+
+    
   '';
 
   installPhase = ''
     mkdir --parents $out/lib $out/include
-    cp icat $out/bin
+    cp tmp/kjuv. $out/bin
   '';
 }
