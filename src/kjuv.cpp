@@ -21,7 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// Largely cribbed from 
+// Largely cribbed from
 // https://github.com/capnproto/node-capnp/blob/node14/src/node-capnp/capnp.cc
 
 #include <kj/async.h>
@@ -36,9 +36,6 @@
 #include <unistd.h>
 
 namespace kj {
-
-// =======================================================================================
-// KJ <-> libuv glue.
 
 #define UV_CALL(code, ...)                \
   {                                             \
@@ -65,16 +62,21 @@ static void setCloseOnExec(int fd) {
 
 static int applyFlags(int fd, uint flags) {
   if (flags & kj::LowLevelAsyncIoProvider::ALREADY_NONBLOCK) {
-    KJ_DREQUIRE(fcntl(fd, F_GETFL) & O_NONBLOCK, "You claimed you set NONBLOCK, but you didn't.");
-  } else {
+    KJ_DREQUIRE(
+      fcntl(fd, F_GETFL) & O_NONBLOCK,
+      "You claimed you set NONBLOCK, but you didn't.");
+  }
+  else {
     setNonblocking(fd);
   }
 
   if (flags & kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP) {
     if (flags & kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC) {
-      KJ_DREQUIRE(fcntl(fd, F_GETFD) & FD_CLOEXEC,
-                  "You claimed you set CLOEXEC, but you didn't.");
-    } else {
+      KJ_DREQUIRE(
+        fcntl(fd, F_GETFD) & FD_CLOEXEC,
+        "You claimed you set CLOEXEC, but you didn't.");
+    }
+    else {
       setCloseOnExec(fd);
     }
   }
@@ -92,10 +94,10 @@ UvEventPort::UvEventPort(uv_loop_t* loop, const kj::MonotonicClock& clock)
   : uvLoop{loop}
   , kjLoop{*this}
   , clock{clock}
-  , timerImpl(clock.now())
-  , uvTimer(uv_timer_init, uvLoop)
-  , uvRunnable(uv_idle_init, uvLoop)
-  , uvWake(uv_async_init, uvLoop, &doWakeup) {
+  , timerImpl{clock.now()}
+  , uvTimer{uv_timer_init, uvLoop}
+  , uvRunnable{uv_idle_init, uvLoop}
+  , uvWake{uv_async_init, uvLoop, &doWakeup} {
 
   uvTimer->data = this;
   uvRunnable->data = this;
@@ -108,6 +110,7 @@ UvEventPort::~UvEventPort() {
 
 void UvEventPort::doRun(uv_idle_t* handle) {
   KJ_DASSERT(handle != nullptr);
+  KJ_DASSERT(handle->data != nullptr);
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->run();
 }
@@ -135,6 +138,7 @@ void UvEventPort::scheduleTimers() {
 
 void UvEventPort::doTimer(uv_timer_t* handle)  {
   KJ_DASSERT(handle != nullptr);
+  KJ_DASSERT(handle->data != nullptr);
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->fireTimers();
 }
@@ -146,6 +150,7 @@ void UvEventPort::fireTimers() {
 
 void UvEventPort::doWakeup(uv_async_t* handle)  {
   KJ_DASSERT(handle != nullptr);
+  KJ_DASSERT(handle->data != nullptr);
   auto* self = reinterpret_cast<UvEventPort*>(handle->data);
   self->fireWakeup();
 }
@@ -201,13 +206,14 @@ static constexpr uint NEW_FD_FLAGS =
 // We always try to open FDs with CLOEXEC and NONBLOCK already set on Linux,
 // but on other platforms this is not possible.
 
-class OwnedFileDescriptor {
-public:
+struct OwnedFileDescriptor {
   OwnedFileDescriptor(uv_loop_t* loop, int fd, uint flags)
-    : uvLoop(loop), fd(applyFlags(fd, flags)), flags(flags),
-        uvPoller(uv_poll_init, uvLoop, fd) {
+    : uvLoop{loop}
+    , fd{applyFlags(fd, flags)}
+    , flags{flags}
+    , uvPoller{uv_poll_init, uvLoop, fd} {
     uvPoller->data = this;
-    UV_CALL(uv_poll_start(uvPoller, 0, &pollCallback));
+    UV_CALL(uv_poll_start(uvPoller, 0, &doPoll));
   }
 
   ~OwnedFileDescriptor() noexcept(false) {
@@ -225,31 +231,39 @@ public:
   }
 
   kj::Promise<void> onReadable() {
-    if (stopped) return kj::READY_NOW;
+    if (stopped) {
+      return kj::READY_NOW;
+    }
 
-    KJ_REQUIRE(readable == nullptr, "Must wait for previous event to complete.");
+    KJ_REQUIRE(
+      readable == nullptr,
+      "Must wait for previous event to complete.");
 
-    auto paf = kj::newPromiseAndFulfiller<void>();
-    readable = kj::mv(paf.fulfiller);
+    auto [promise, fulfiller] = kj::newPromiseAndFulfiller<void>();
+    readable = kj::mv(fulfiller);
 
     int flags = UV_READABLE | (writable == nullptr ? 0 : UV_WRITABLE);
-    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
+    UV_CALL(uv_poll_start(uvPoller, flags, &doPoll));
 
-    return kj::mv(paf.promise);
+    return kj::mv(promise);
   }
 
   kj::Promise<void> onWritable() {
-    if (stopped) return kj::READY_NOW;
+    if (stopped) {
+      return kj::READY_NOW;
+    }
 
-    KJ_REQUIRE(writable == nullptr, "Must wait for previous event to complete.");
+    KJ_REQUIRE(
+      writable == nullptr,
+      "Must wait for previous event to complete.");
 
-    auto paf = kj::newPromiseAndFulfiller<void>();
-    writable = kj::mv(paf.fulfiller);
+    auto [promise, fulfiller] = kj::newPromiseAndFulfiller<void>();
+    writable = kj::mv(fulfiller);
 
     int flags = UV_WRITABLE | (readable == nullptr ? 0 : UV_READABLE);
-    UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
+    UV_CALL(uv_poll_start(uvPoller, flags, &doPoll));
 
-    return kj::mv(paf.promise);
+    return kj::mv(promise);
   }
 
 protected:
@@ -263,8 +277,11 @@ private:
   bool stopped = false;
   UvHandle<uv_poll_t> uvPoller;
 
-  static void pollCallback(uv_poll_t* handle, int status, int events) {
-    reinterpret_cast<OwnedFileDescriptor*>(handle->data)->pollDone(status, events);
+  static void doPoll(uv_poll_t* handle, int status, int events) {
+    KJ_DASSERT(handle != nullptr);
+    KJ_DASSERT(handle->data != nullptr);
+    auto* self = reinterpret_cast<OwnedFileDescriptor*>(handle->data);
+    self->pollDone(status, events);
   }
 
   void pollDone(int status, int events) {
@@ -286,7 +303,8 @@ private:
       // libuv automatically performs uv_poll_stop() before calling poll_cb with an error status.
       stopped = true;
 
-    } else {
+    }
+    else {
       // Fire the events.
       if (events & UV_READABLE) {
         KJ_ASSERT_NONNULL(readable)->fulfill();
@@ -300,12 +318,13 @@ private:
       // Update the poll flags.
       int flags = (readable == nullptr ? 0 : UV_READABLE) |
                   (writable == nullptr ? 0 : UV_WRITABLE);
-      UV_CALL(uv_poll_start(uvPoller, flags, &pollCallback));
+      UV_CALL(uv_poll_start(uvPoller, flags, &doPoll));
     }
   }
 };
 
-class UvIoStream: public OwnedFileDescriptor, public kj::AsyncIoStream {
+struct UvIoStream: OwnedFileDescriptor, kj::AsyncIoStream {
+
   // IoStream implementation on top of libuv.  This is mostly a copy of the UnixEventPort-based
   // implementation in kj/async-io.c++.  We use uv_poll, which the libuv docs say is slow
   // "especially on Windows".  I'm guessing it's not so slow on Unix, since it matches the
@@ -313,9 +332,9 @@ class UvIoStream: public OwnedFileDescriptor, public kj::AsyncIoStream {
   //
   // TODO(cleanup):  Allow better code sharing between the two.
 
-public:
   UvIoStream(uv_loop_t* loop, int fd, uint flags)
-      : OwnedFileDescriptor(loop, fd, flags) {}
+    : OwnedFileDescriptor{loop, fd, flags} {}
+
   virtual ~UvIoStream() noexcept(false) {}
 
   kj::Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
@@ -357,7 +376,8 @@ public:
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
     if (pieces.size() == 0) {
       return writeInternal(nullptr, nullptr);
-    } else {
+    }
+    else {
       return writeInternal(pieces[0], pieces.slice(1, pieces.size()));
     }
   }
@@ -390,10 +410,12 @@ private:
       return onReadable().then([this, buffer, minBytes, maxBytes, alreadyRead]() {
         return tryReadInternal(buffer, minBytes, maxBytes, alreadyRead);
       });
-    } else if (n == 0) {
+    }
+    else if (n == 0) {
       // EOF -OR- maxBytes == 0.
       return alreadyRead;
-    } else if (kj::implicitCast<size_t>(n) < minBytes) {
+    }
+    else if (kj::implicitCast<size_t>(n) < minBytes) {
       // The kernel returned fewer bytes than we asked for (and fewer than we need).  This indicates
       // that we're out of data.  It could also mean we're at EOF.  We could check for EOF by doing
       // another read just to see if it returns zero, but that would mean making a redundant syscall
@@ -408,14 +430,17 @@ private:
       return onReadable().then([this, buffer, minBytes, maxBytes, alreadyRead]() {
         return tryReadInternal(buffer, minBytes, maxBytes, alreadyRead);
       });
-    } else {
+    }
+    else {
       // We read enough to stop here.
       return alreadyRead + n;
     }
   }
 
-  kj::Promise<void> writeInternal(kj::ArrayPtr<const byte> firstPiece,
-                                  kj::ArrayPtr<const kj::ArrayPtr<const byte>> morePieces) {
+  kj::Promise<void> writeInternal(
+    kj::ArrayPtr<const byte> firstPiece,
+    kj::ArrayPtr<const kj::ArrayPtr<const byte>> morePieces) {
+
     KJ_STACK_ARRAY(struct iovec, iov, 1 + morePieces.size(), 16, 128);
 
     // writev() interface is not const-correct.  :(
@@ -466,10 +491,10 @@ private:
   }
 };
 
-class UvConnectionReceiver final: public kj::ConnectionReceiver, public OwnedFileDescriptor {
-  // Like UvIoStream but for ConnectionReceiver.  This is also largely copied from kj/async-io.c++.
+struct UvConnectionReceiver final: kj::ConnectionReceiver, OwnedFileDescriptor {
+  // Like UvIoStream but for ConnectionReceiver.
+  // This is also largely copied from kj/async-io.c++.
 
-public:
   UvConnectionReceiver(uv_loop_t* loop, int fd, uint flags)
       : OwnedFileDescriptor(loop, fd, flags) {}
 
@@ -485,7 +510,8 @@ public:
 
     if (newFd >= 0) {
       return kj::Own<kj::AsyncIoStream>(kj::heap<UvIoStream>(uvLoop, newFd, NEW_FD_FLAGS));
-    } else {
+    }
+    else {
       int error = errno;
 
       switch (error) {
@@ -506,16 +532,17 @@ public:
         case ENETUNREACH:
         case ECONNABORTED:
         case ETIMEDOUT:
-          // According to the Linux man page, accept() may report an error if the accepted
-          // connection is already broken.  In this case, we really ought to just ignore it and
-          // keep waiting.  But it's hard to say exactly what errors are such network errors and
-          // which ones are permanent errors.  We've made a guess here.
+          // According to the Linux man page, accept() may report an error
+          // if the accepted connection is already broken.
+          // In this case, we really ought to just ignore it and
+          // keep waiting.  But it's hard to say exactly what errors
+          // are such network errors and which ones are permanent errors.
+          // We've made a guess here.
           goto retry;
 
         default:
           KJ_FAIL_SYSCALL("accept", error);
       }
-
     }
   }
 
@@ -552,20 +579,24 @@ public:
     return kj::heap<UvIoStream>(eventPort.getUvLoop(), fd, flags);
   }
   kj::Promise<kj::Own<kj::AsyncIoStream>> wrapConnectingSocketFd(
-      int fd, const struct sockaddr* addr, uint addrlen, uint flags = 0) override {
-    // Unfortunately connect() doesn't fit the mold of KJ_NONBLOCKING_SYSCALL, since it indicates
-    // non-blocking using EINPROGRESS.
+    int fd, const struct sockaddr* addr,
+    uint addrlen, uint flags = 0) override {
+
+    // Unfortunately connect() doesn't fit the mold of KJ_NONBLOCKING_SYSCALL,
+    // since it indicates non-blocking using EINPROGRESS.
     for (;;) {
       if (::connect(fd, addr, addrlen) < 0) {
         int error = errno;
         if (error == EINPROGRESS) {
           // Fine.
           break;
-        } else if (error != EINTR) {
+        }
+        else if (error != EINTR) {
           KJ_FAIL_SYSCALL("connect()", error) { break; }
           return kj::Own<kj::AsyncIoStream>();
         }
-      } else {
+      }
+      else {
         // no error
         break;
       }
@@ -584,10 +615,13 @@ public:
     });
   }
 
-  kj::Own<kj::ConnectionReceiver> wrapListenSocketFd(int fd,
-      kj::LowLevelAsyncIoProvider::NetworkFilter& filter, uint flags = 0) override {
-    // TODO(soon): TODO(security): Actually use `filter`. Currently no API is exposed to set a
-    //   filter so it's not important yet.
+  kj::Own<kj::ConnectionReceiver> wrapListenSocketFd(
+    int fd,
+    kj::LowLevelAsyncIoProvider::NetworkFilter& filter,
+    uint flags = 0) override {
+
+    // TODO(soon): TODO(security): Actually use `filter`.
+    // Currently no API is exposed to set a filter so it's not important yet.
     return kj::heap<UvConnectionReceiver>(eventPort.getUvLoop(), fd, flags);
   }
 
@@ -599,7 +633,8 @@ private:
   UvEventPort& eventPort;
 };
 
-kj::Own<kj::LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(kj::UvEventPort& eventPort) {
+kj::Own<kj::LowLevelAsyncIoProvider> newUvLowLevelAsyncIoProvider(
+  kj::UvEventPort& eventPort) {
   return kj::heap<UvLowLevelAsyncIoProvider>(eventPort);
 }
 
