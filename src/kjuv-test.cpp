@@ -19,7 +19,8 @@ struct UvTest
   kj::UvEventPort eventPort{uvLoop};
   kj::EventLoop kjLoop{eventPort};
   kj::WaitScope waitScope{kjLoop};
-  kj::Own<kj::LowLevelAsyncIoProvider> lowLevel{kj::newUvLowLevelAsyncIoProvider(eventPort)};
+  kj::Own<kj::LowLevelAsyncIoProvider> lowLevel{
+    kj::newUvLowLevelAsyncIoProvider(eventPort)};
   kj::Own<kj::AsyncIoProvider> aio{kj::newAsyncIoProvider(*lowLevel)};
 };
 
@@ -37,7 +38,7 @@ TEST_F(UvTest, Reject) {
 
 TEST_F(UvTest, Timer) {
   auto& timer = aio->getTimer();
-  auto promise = timer.afterDelay(kj::NANOSECONDS*1);
+  auto promise = timer.afterDelay(kj::NANOSECONDS);
   promise.wait(waitScope);
 }
 
@@ -45,6 +46,9 @@ TEST_F(UvTest, TimerReschedule) {
   auto& timer = aio->getTimer();
   timer.afterDelay(kj::NANOSECONDS).then(
     [&timer]{
+      return timer.afterDelay(kj::NANOSECONDS);
+    })
+    .then([&timer]{
       return timer.afterDelay(kj::NANOSECONDS);
     }).wait(waitScope);
 }
@@ -65,11 +69,10 @@ TEST_F(UvTest, CrossThreadFulfillerOtherThread) {
 
 TEST_F(UvTest, PipeStream) {
   constexpr auto txt = "hello, world"_kj;
-  auto pipe = aio->newOneWayPipe();
-  auto pth = aio->newPipeThread([txt](auto&, auto& stream, auto& waitScope) {
+  auto [thread, pipe] = aio->newPipeThread([txt](auto&, auto& stream, auto& waitScope) {
     stream.write(txt.begin(), txt.size()).wait(waitScope);
   });
-  auto reply = pth.pipe->readAllText().wait(waitScope);
+  auto reply = pipe->readAllText().wait(waitScope);
   EXPECT_STREQ(reply.cStr(), txt.cStr());
 }
 

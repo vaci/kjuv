@@ -44,7 +44,9 @@ namespace kj {
   }
 
 
-static void setNonblocking(int fd) {
+namespace {
+
+void setNonblocking(int fd) {
   int flags;
   KJ_SYSCALL(flags = fcntl(fd, F_GETFL));
   if ((flags & O_NONBLOCK) == 0) {
@@ -52,7 +54,7 @@ static void setNonblocking(int fd) {
   }
 }
 
-static void setCloseOnExec(int fd) {
+void setCloseOnExec(int fd) {
   int flags;
   KJ_SYSCALL(flags = fcntl(fd, F_GETFD));
   if ((flags & FD_CLOEXEC) == 0) {
@@ -60,7 +62,7 @@ static void setCloseOnExec(int fd) {
   }
 }
 
-static int applyFlags(int fd, uint flags) {
+int applyFlags(int fd, uint flags) {
   if (flags & kj::LowLevelAsyncIoProvider::ALREADY_NONBLOCK) {
     KJ_DREQUIRE(
       fcntl(fd, F_GETFL) & O_NONBLOCK,
@@ -84,10 +86,12 @@ static int applyFlags(int fd, uint flags) {
   return fd;
 }
 
-static kj::AutoCloseFd openEventFd() {
+kj::AutoCloseFd openEventFd() {
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
   return AutoCloseFd(fd);
+}
+
 }
 
 UvEventPort::UvEventPort(uv_loop_t* loop, const kj::MonotonicClock& clock)
@@ -106,6 +110,7 @@ UvEventPort::UvEventPort(uv_loop_t* loop, const kj::MonotonicClock& clock)
 
 UvEventPort::~UvEventPort() {
   uv_timer_stop(uvTimer);
+  uv_idle_stop(uvRunnable);
 }
 
 void UvEventPort::doRun(uv_idle_t* handle) {
@@ -197,6 +202,8 @@ void UvEventPort::setRunnable(bool runnable) {
   }
 }
 
+namespace {
+
 static constexpr uint NEW_FD_FLAGS =
 #if __linux__
   kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC |
@@ -206,8 +213,8 @@ static constexpr uint NEW_FD_FLAGS =
 // We always try to open FDs with CLOEXEC and NONBLOCK already set on Linux,
 // but on other platforms this is not possible.
 
-struct OwnedFileDescriptor {
-  OwnedFileDescriptor(uv_loop_t* loop, int fd, uint flags)
+struct UvFileDescriptor {
+  UvFileDescriptor(uv_loop_t* loop, int fd, uint flags)
     : uvLoop{loop}
     , fd{applyFlags(fd, flags)}
     , flags{flags}
@@ -216,7 +223,7 @@ struct OwnedFileDescriptor {
     UV_CALL(uv_poll_start(uvPoller, 0, &doPoll));
   }
 
-  ~OwnedFileDescriptor() noexcept(false) {
+  ~UvFileDescriptor() noexcept(false) {
     if (!stopped) {
       UV_CALL(uv_poll_stop(uvPoller));
     }
@@ -280,12 +287,12 @@ private:
   static void doPoll(uv_poll_t* handle, int status, int events) {
     KJ_DASSERT(handle != nullptr);
     KJ_DASSERT(handle->data != nullptr);
-    auto* self = reinterpret_cast<OwnedFileDescriptor*>(handle->data);
+    auto* self = reinterpret_cast<UvFileDescriptor*>(handle->data);
     self->pollDone(status, events);
   }
 
   void pollDone(int status, int events) {
-    if (status != 0) {
+    if (KJ_UNLIKELY(status != 0)) {
       // Error.  libuv produces a non-zero status if polling produced POLLERR.  The error code
       // reported by libuv is always EBADF, even if the file descriptor is perfectly legitimate but
       // has simply become disconnected.  Instead of throwing an exception, we'd rather report
@@ -295,6 +302,7 @@ private:
         r->get()->fulfill();
         readable = nullptr;
       }
+
       KJ_IF_MAYBE(w, writable) {
         w->get()->fulfill();
         writable = nullptr;
@@ -323,7 +331,7 @@ private:
   }
 };
 
-struct UvIoStream: OwnedFileDescriptor, kj::AsyncIoStream {
+struct UvIoStream final: UvFileDescriptor, kj::AsyncIoStream {
 
   // IoStream implementation on top of libuv.  This is mostly a copy of the UnixEventPort-based
   // implementation in kj/async-io.c++.  We use uv_poll, which the libuv docs say is slow
@@ -333,7 +341,7 @@ struct UvIoStream: OwnedFileDescriptor, kj::AsyncIoStream {
   // TODO(cleanup):  Allow better code sharing between the two.
 
   UvIoStream(uv_loop_t* loop, int fd, uint flags)
-    : OwnedFileDescriptor{loop, fd, flags} {}
+    : UvFileDescriptor{loop, fd, flags} {}
 
   virtual ~UvIoStream() noexcept(false) {}
 
@@ -491,12 +499,12 @@ private:
   }
 };
 
-struct UvConnectionReceiver final: kj::ConnectionReceiver, OwnedFileDescriptor {
+struct UvConnectionReceiver final: kj::ConnectionReceiver, UvFileDescriptor {
   // Like UvIoStream but for ConnectionReceiver.
   // This is also largely copied from kj/async-io.c++.
 
   UvConnectionReceiver(uv_loop_t* loop, int fd, uint flags)
-      : OwnedFileDescriptor(loop, fd, flags) {}
+      : UvFileDescriptor(loop, fd, flags) {}
 
   kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override {
     int newFd;
@@ -563,11 +571,11 @@ struct UvConnectionReceiver final: kj::ConnectionReceiver, OwnedFileDescriptor {
   }
 };
 
-class UvLowLevelAsyncIoProvider final: public kj::LowLevelAsyncIoProvider {
-public:
-  UvLowLevelAsyncIoProvider(UvEventPort& eventPort): eventPort(eventPort) {}
+}
 
-  //  inline kj::WaitScope& getWaitScope() { return waitScope; }
+struct UvLowLevelAsyncIoProvider final: kj::LowLevelAsyncIoProvider {
+
+  UvLowLevelAsyncIoProvider(UvEventPort& eventPort): eventPort(eventPort) {}
 
   kj::Own<kj::AsyncInputStream> wrapInputFd(int fd, uint flags = 0) override {
     return kj::heap<UvIoStream>(eventPort.getUvLoop(), fd, flags);
