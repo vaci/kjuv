@@ -21,17 +21,11 @@
             pkgs.capnproto
             pkgs.openssl
             pkgs.gcc
-            pkgs.libuv
+            pkgs.libuv.dev
             pkgs.gtest
+            pkgs.ninja
             pkgs.pkg-config
           ];
-
-          shellHook = ''
-            export LIBUV_SRC=${pkgs.libuv.src}
-            export LIBUV_DIR=${pkgs.libuv}
-            export LIBUV_INCLUDE_DIRS="${pkgs.libuv.src}/include"
-          '';
-
         };
       };
 }

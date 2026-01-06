@@ -17,6 +17,16 @@ NIX_BUILD_CORES ?= 7
 EKAM_REMAP_BYPASS_DIRS = $(HOME)/.cache/
 EKAM_FLAGS := -j $(NIX_BUILD_CORES)
 
+build/build.ninja:
+	cmake -S . -B build -G "Ninja Multi-Config"
+
+compile_commands.json: build/build.ninja
+	cd build && ninja -t compdb > ../compile_commands.json
+
+.PHONY: ninja
+ninja: build/build.ninja compile_commands.json
+	cd build && ninja
+
 .DEFAULT: release
 
 .PHONY: debug debug-continuous
@@ -34,5 +44,5 @@ lib: release
 	ar r libkjuv.a tmp/kjuv.o
 
 clean:
-	rm -fr bin tmp
+	rm -fr bin build tmp
 

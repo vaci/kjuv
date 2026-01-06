@@ -4,23 +4,24 @@ include(GoogleTest)
 
 project(kjuv LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 find_package(CapnProto REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(GTest REQUIRED)
 
-add_library(kjuv
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+
+add_library(kjuv STATIC
   src/kjuv.cpp
 )
 
-set(LIBUV_INCLUDE_DIRS "$ENV{LIBUV_DIR}/include")
-set(LIBUV_LIBRARY "$ENV{LIBUV_DIR}/lib/libuv.so")
-
-target_include_directories(kjuv PRIVATE
-  ${CAPNP_INCLUDE_DIRS}
-  ${LIBUV_INCLUDE_DIRS}
+include_directories(kjuv PRIVATE
+  CapnProto::capnp
+  PkgConfig::LIBUV
 )
 
 add_executable(kjuv-test
@@ -33,8 +34,15 @@ target_link_libraries(kjuv-test PRIVATE
   CapnProto::kj-async
   CapnProto::kj
   OpenSSL::SSL
-  ${LIBUV_LIBRARY}
+  PkgConfig::LIBUV
   GTest::gtest
 )
 
 gtest_discover_tests(kjuv-test)
+
+install(FILES src/kjuv.h DESTINATION include)
+install(
+  TARGETS kjuv
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+)
