@@ -34,9 +34,9 @@ public:
     uv_close(reinterpret_cast<uv_handle_t*>(handle), &closeCallback);
   }
 
-  inline HandleType* operator->() { return handle; }
-  inline operator HandleType*() { return handle; }
-  inline operator uv_handle_t*() { return reinterpret_cast<uv_handle_t*>(handle); }
+  HandleType* operator->() { return handle; }
+  operator HandleType*() { return handle; }
+  operator uv_handle_t*() { return reinterpret_cast<uv_handle_t*>(handle); }
 
 private:
   HandleType* handle;

@@ -43,7 +43,6 @@ namespace kj {
     KJ_ASSERT(result == 0, uv_strerror(result), ##__VA_ARGS__); \
   }
 
-
 namespace {
 
 void setNonblocking(int fd) {
@@ -89,7 +88,7 @@ int applyFlags(int fd, uint flags) {
 kj::AutoCloseFd openEventFd() {
   int fd;
   KJ_SYSCALL(fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-  return AutoCloseFd(fd);
+  return kj::AutoCloseFd(fd);
 }
 
 }
